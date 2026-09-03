@@ -181,13 +181,22 @@ const handleSessionStart = (ctx: EventContext) =>
     const patches: Patch[] = [];
 
     const existing = store.get(ctx.sessionId);
-    // Reset on re-start with the same session id (Claude Code's /clear shape
-    // and resume cases). Pi no longer triggers SessionStart per prompt —
-    // pi's per-prompt boundary is TurnOpen — so there is no pi case to
-    // exempt here. SessionStart for a pi session fires once, synthesized
-    // eagerly by `startPiSession`, before any pi events arrive; that path
-    // creates a fresh session and the `existing` branch is not taken.
-    if (existing) {
+    // Reset on re-start with the same session id (Claude Code's /clear shape).
+    // Pi no longer triggers SessionStart per prompt — pi's per-prompt boundary
+    // is TurnOpen — so there is no pi case to exempt here. SessionStart for a
+    // pi session fires once, synthesized eagerly by `startPiSession`, before
+    // any pi events arrive; that path creates a fresh session and the
+    // `existing` branch is not taken.
+    //
+    // `claude --resume` also re-fires SessionStart under the *same* session
+    // id, but there the conversation continues rather than starting over:
+    // resetting would drop every turn the user is resuming in order to see.
+    // Claude Code distinguishes the two via SessionStart's `source` field
+    // ("startup" | "resume" | "clear" | "compact"), so keep the turn tree
+    // when the restart is a resume.
+    // NOTE: "compact" is likely to want the same treatment — confirm the
+    // value actually sent (it is logged with the hook event) before adding it.
+    if (existing && ctx.data.source !== "resume") {
       patches.push(...resetSession(existing));
     }
     const s = ensureSession(store, ctx.sessionId, ctx.cwd, ctx.data.tmux_session, ctx.data.source);

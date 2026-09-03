@@ -2110,6 +2110,55 @@ describe("Event Handler", () => {
       expect(resetSession.turns.length).toBe(1);
       expect(resetSession.plan).toBeNull();
     });
+
+    it("SessionStart with source=resume keeps the turn tree", () => {
+      startSession(deps, "s1", { slug: "original", source: "startup" });
+      fire(deps, "UserPromptSubmit", "s1", { prompt: "do stuff" });
+      fire(deps, "PreToolUse", "s1", { tool_name: "Read", tool_use_id: "t1" });
+
+      const before = deps.store.get("s1")!;
+      expect(before.currentTurn).toBe(1);
+      expect(before.totalToolCount).toBe(1);
+      expect(before.turns.length).toBe(2);
+
+      // `claude --resume` re-fires SessionStart under the same session id.
+      const patches = fire(deps, "SessionStart", "s1", { source: "resume" });
+
+      const after = deps.store.get("s1")!;
+      expect(after.currentTurn).toBe(1);
+      expect(after.totalToolCount).toBe(1);
+      expect(after.turns.length).toBe(2);
+      expect(after.turns[1]?.prompt?.text).toBe("do stuff");
+      expect(after.toolIndex["t1"]).toBeDefined();
+
+      // None of the reset patches should be emitted.
+      expect(patches).not.toContainEqual({ op: "set_plan", plan: null });
+      expect(patches).not.toContainEqual({ op: "set_streaming_text", text: null });
+      expect(patches.some(p => p.op === "set_token_usage")).toBe(false);
+    });
+
+    it("SessionStart with a non-resume source still resets", () => {
+      startSession(deps, "s1");
+      fire(deps, "UserPromptSubmit", "s1", { prompt: "do stuff" });
+      fire(deps, "PreToolUse", "s1", { tool_name: "Read", tool_use_id: "t1" });
+      expect(deps.store.get("s1")!.turns.length).toBe(2);
+
+      fire(deps, "SessionStart", "s1", { source: "startup" });
+
+      const after = deps.store.get("s1")!;
+      expect(after.currentTurn).toBe(0);
+      expect(after.totalToolCount).toBe(0);
+      expect(after.turns.length).toBe(1);
+    });
+
+    it("SessionStart with source=resume on an unknown session creates it", () => {
+      const patches = fire(deps, "SessionStart", "fresh", { source: "resume" });
+
+      const session = deps.store.get("fresh")!;
+      expect(session).toBeDefined();
+      expect(session.turns.length).toBe(1);
+      expect(patches.some(p => p.op === "set_meta")).toBe(true);
+    });
   });
 
   // ────────────────────────────────────────────────────────────────────
