@@ -20,8 +20,9 @@ import type { SessionStoreService } from "../services/session-store.js";
 import { SessionStore } from "../services/session-store.js";
 import type { InboxService } from "../services/inbox.js";
 import { Inbox } from "../services/inbox.js";
-import { Fs } from "@gravity/shared";
+import { Fs, parseTranscript } from "@gravity/shared";
 import type { FsService } from "@gravity/shared";
+import { backfillSession } from "../state/backfill.js";
 import {
   createSession,
   resetSession,
@@ -147,6 +148,60 @@ const lookupDisplayName = (cwd: string, sessionId: string): Effect.Effect<string
     );
   });
 
+/**
+ * Largest transcript worth replaying. Parsing is ~5ms/MB, so the cap is not
+ * about CPU — it bounds the memory a single pathological session can pull
+ * into the store when a hook fires.
+ */
+const MAX_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Most recent turns to restore. Deep history costs render time in every
+ * terminal that opens the session, and the value of backfill drops sharply
+ * past the last few dozen exchanges.
+ */
+const MAX_BACKFILL_TURNS = 200;
+
+/**
+ * Rebuild a resumed session's turn tree from its transcript.
+ *
+ * Session state is memory-only, so anything that restarts this process
+ * leaves `claude --resume` reattached to a conversation the server cannot
+ * render — while Claude Code itself replays it from the very file read
+ * here. Only runs for a session with no history of its own; a server that
+ * survived the resume already holds better state than the transcript can
+ * reconstruct (agents, plans, per-turn diffs).
+ */
+const backfillFromTranscript = (
+  session: Session,
+  transcriptPath: string,
+): Effect.Effect<Patch[], never, FsService> =>
+  Effect.gen(function* () {
+    const fs = yield* Effect.service(Fs);
+
+    const stat = yield* pipe(
+      fs.stat(transcriptPath),
+      Effect.catch(() => Effect.succeed(null)),
+    );
+    if (!stat || stat.size === 0 || stat.size > MAX_TRANSCRIPT_BYTES) return [];
+
+    const raw = yield* pipe(
+      fs.readFile(transcriptPath),
+      Effect.catch(() => Effect.succeed(null)),
+    );
+    if (!raw) return [];
+
+    return yield* Effect.sync(() => {
+      const parsed = parseTranscript(raw, { maxTurns: MAX_BACKFILL_TURNS });
+      if (parsed.turns.length === 0) return [];
+      return backfillSession(session, parsed).patches;
+    });
+  });
+
+/** True when a session holds nothing worth preserving over a replay. */
+const hasNoHistory = (s: Session): boolean =>
+  s.totalToolCount === 0 && s.turns.every((t) => t.prompt === null && t.steps.length === 0);
+
 /** Ensure a session exists, creating if needed. */
 const ensureSession = (
   store: SessionStoreService,
@@ -181,13 +236,22 @@ const handleSessionStart = (ctx: EventContext) =>
     const patches: Patch[] = [];
 
     const existing = store.get(ctx.sessionId);
-    // Reset on re-start with the same session id (Claude Code's /clear shape
-    // and resume cases). Pi no longer triggers SessionStart per prompt —
-    // pi's per-prompt boundary is TurnOpen — so there is no pi case to
-    // exempt here. SessionStart for a pi session fires once, synthesized
-    // eagerly by `startPiSession`, before any pi events arrive; that path
-    // creates a fresh session and the `existing` branch is not taken.
-    if (existing) {
+    // Reset on re-start with the same session id (Claude Code's /clear shape).
+    // Pi no longer triggers SessionStart per prompt — pi's per-prompt boundary
+    // is TurnOpen — so there is no pi case to exempt here. SessionStart for a
+    // pi session fires once, synthesized eagerly by `startPiSession`, before
+    // any pi events arrive; that path creates a fresh session and the
+    // `existing` branch is not taken.
+    //
+    // `claude --resume` also re-fires SessionStart under the *same* session
+    // id, but there the conversation continues rather than starting over:
+    // resetting would drop every turn the user is resuming in order to see.
+    // Claude Code distinguishes the two via SessionStart's `source` field
+    // ("startup" | "resume" | "clear" | "compact"), so keep the turn tree
+    // when the restart is a resume.
+    // NOTE: "compact" is likely to want the same treatment — confirm the
+    // value actually sent (it is logged with the hook event) before adding it.
+    if (existing && ctx.data.source !== "resume") {
       patches.push(...resetSession(existing));
     }
     const s = ensureSession(store, ctx.sessionId, ctx.cwd, ctx.data.tmux_session, ctx.data.source);
@@ -209,6 +273,15 @@ const handleSessionStart = (ctx: EventContext) =>
     if (modelId && typeof modelId === "string" && modelId.length > 0) {
       s.modelName = shortModelName(modelId);
       patches.push({ op: "set_meta", modelName: s.modelName });
+    }
+
+    // Resuming into a server that has no memory of this conversation — a
+    // restart, or a session that predates this process. Claude Code replays
+    // the transcript to restore its own context; do the same so the two
+    // views agree.
+    const transcriptPath = ctx.data.transcript_path;
+    if (ctx.data.source === "resume" && transcriptPath && hasNoHistory(s)) {
+      patches.push(...(yield* backfillFromTranscript(s, transcriptPath)));
     }
 
     return patches;

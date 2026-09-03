@@ -143,7 +143,10 @@ export const processHookMessage = async (
   const data = (msg.data as HookData) || {};
   const needsResponse = msg.needs_response === true;
 
-  logMsg(`Hook event: ${eventName} session=${sessionId}`);
+  // `source` is what distinguishes a fresh start from a resume/compact on
+  // SessionStart; log it so the distinction is observable in the field.
+  const eventSource = typeof data.source === "string" ? ` source=${data.source}` : "";
+  logMsg(`Hook event: ${eventName} session=${sessionId}${eventSource}`);
   deps.markHookReceived();
 
   // Reject bidirectional events if no capable terminal is connected.

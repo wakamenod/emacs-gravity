@@ -33,8 +33,9 @@ function fire(
   data: HookData = {},
   pid: number | null = 123,
   hookSocket?: Socket,
+  files: Record<string, string> = {},
 ): Patch[] {
-  const fullLayer = Layer.mergeAll(deps.layer, FsTest({}));
+  const fullLayer = Layer.mergeAll(deps.layer, FsTest(files));
   return Effect.runSync(
     Effect.provide(
       handleEvent(event as any, sessionId, "/test/project", data, pid, hookSocket),
@@ -2109,6 +2110,174 @@ describe("Event Handler", () => {
       expect(resetSession.totalToolCount).toBe(0);
       expect(resetSession.turns.length).toBe(1);
       expect(resetSession.plan).toBeNull();
+    });
+
+    it("SessionStart with source=resume keeps the turn tree", () => {
+      startSession(deps, "s1", { slug: "original", source: "startup" });
+      fire(deps, "UserPromptSubmit", "s1", { prompt: "do stuff" });
+      fire(deps, "PreToolUse", "s1", { tool_name: "Read", tool_use_id: "t1" });
+
+      const before = deps.store.get("s1")!;
+      expect(before.currentTurn).toBe(1);
+      expect(before.totalToolCount).toBe(1);
+      expect(before.turns.length).toBe(2);
+
+      // `claude --resume` re-fires SessionStart under the same session id.
+      const patches = fire(deps, "SessionStart", "s1", { source: "resume" });
+
+      const after = deps.store.get("s1")!;
+      expect(after.currentTurn).toBe(1);
+      expect(after.totalToolCount).toBe(1);
+      expect(after.turns.length).toBe(2);
+      expect(after.turns[1]?.prompt?.text).toBe("do stuff");
+      expect(after.toolIndex["t1"]).toBeDefined();
+
+      // None of the reset patches should be emitted.
+      expect(patches).not.toContainEqual({ op: "set_plan", plan: null });
+      expect(patches).not.toContainEqual({ op: "set_streaming_text", text: null });
+      expect(patches.some(p => p.op === "set_token_usage")).toBe(false);
+    });
+
+    it("SessionStart with a non-resume source still resets", () => {
+      startSession(deps, "s1");
+      fire(deps, "UserPromptSubmit", "s1", { prompt: "do stuff" });
+      fire(deps, "PreToolUse", "s1", { tool_name: "Read", tool_use_id: "t1" });
+      expect(deps.store.get("s1")!.turns.length).toBe(2);
+
+      fire(deps, "SessionStart", "s1", { source: "startup" });
+
+      const after = deps.store.get("s1")!;
+      expect(after.currentTurn).toBe(0);
+      expect(after.totalToolCount).toBe(0);
+      expect(after.turns.length).toBe(1);
+    });
+
+    it("SessionStart with source=resume on an unknown session creates it", () => {
+      const patches = fire(deps, "SessionStart", "fresh", { source: "resume" });
+
+      const session = deps.store.get("fresh")!;
+      expect(session).toBeDefined();
+      expect(session.turns.length).toBe(1);
+      expect(patches.some(p => p.op === "set_meta")).toBe(true);
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // Transcript backfill on resume
+  // ────────────────────────────────────────────────────────────────────
+
+  describe("transcript backfill", () => {
+    const TRANSCRIPT = "/transcripts/sess.jsonl";
+    const at = (n: number) => new Date(Date.parse("2026-09-03T00:00:00.000Z") + n * 1000).toISOString();
+
+    /** Two turns: one with a completed tool, one plain. */
+    const fixture = [
+      JSON.stringify({
+        type: "user", message: { content: "restore me" },
+        cwd: "/test/project", gitBranch: "master", sessionId: "s1", timestamp: at(0),
+      }),
+      JSON.stringify({
+        type: "assistant", timestamp: at(1),
+        message: { id: "m1", model: "claude-opus-5", content: [{ type: "text", text: "Reading." }] },
+      }),
+      JSON.stringify({
+        type: "assistant", timestamp: at(2),
+        message: { id: "m1", content: [{ type: "tool_use", id: "tu_1", name: "Read", input: { file_path: "/a.ts" } }] },
+      }),
+      JSON.stringify({
+        type: "user", timestamp: at(5), toolUseResult: { content: "file body" },
+        message: { content: [{ type: "tool_result", tool_use_id: "tu_1", is_error: false, content: "file body" }] },
+      }),
+      JSON.stringify({
+        type: "assistant", timestamp: at(6),
+        message: { id: "m2", content: [{ type: "text", text: "All done." }] },
+      }),
+      JSON.stringify({
+        type: "user", message: { content: "second prompt" },
+        cwd: "/test/project", sessionId: "s1", timestamp: at(10),
+      }),
+      JSON.stringify({
+        type: "assistant", timestamp: at(11),
+        message: { id: "m3", content: [{ type: "text", text: "Second answer." }] },
+      }),
+    ].join("\n");
+
+    it("rebuilds the turn tree when resuming a session the server never saw", () => {
+      const patches = fire(
+        deps, "SessionStart", "s1",
+        { source: "resume", transcript_path: TRANSCRIPT },
+        123, undefined, { [TRANSCRIPT]: fixture },
+      );
+
+      const session = deps.store.get("s1")!;
+      expect(session.turns.length).toBe(3); // turn 0 + two restored turns
+      expect(session.turns[1]?.prompt?.text).toBe("restore me");
+      expect(session.turns[1]?.stopText).toBe("All done.");
+      expect(session.turns[2]?.prompt?.text).toBe("second prompt");
+      expect(session.turns[2]?.stopText).toBe("Second answer.");
+      expect(session.totalToolCount).toBe(1);
+
+      const tool = session.turns[1]!.steps[0]!.tools[0]!;
+      expect(tool.toolUseId).toBe("tu_1");
+      expect(tool.name).toBe("Read");
+      expect(tool.status).toBe("done");
+      expect(tool.assistantText).toBe("Reading.");
+      // Duration comes from the transcript's clock, not wall time.
+      expect(tool.duration).toBe(3);
+
+      expect(session.toolIndex["tu_1"]).toBeDefined();
+      expect(session.branch).toBe("master");
+      expect(session.modelName).toBe("opus");
+
+      // Terminals replay the same tree from the patch stream.
+      expect(patches.filter(p => p.op === "add_turn").length).toBe(2);
+      expect(patches.filter(p => p.op === "add_tool").length).toBe(1);
+      expect(patches.filter(p => p.op === "complete_tool").length).toBe(1);
+    });
+
+    it("does not backfill a session that still holds its own history", () => {
+      startSession(deps, "s1", { source: "startup" });
+      fire(deps, "UserPromptSubmit", "s1", { prompt: "live prompt" });
+
+      fire(
+        deps, "SessionStart", "s1",
+        { source: "resume", transcript_path: TRANSCRIPT },
+        123, undefined, { [TRANSCRIPT]: fixture },
+      );
+
+      const session = deps.store.get("s1")!;
+      expect(session.turns.length).toBe(2);
+      expect(session.turns[1]?.prompt?.text).toBe("live prompt");
+    });
+
+    it("does not backfill on a non-resume start", () => {
+      fire(
+        deps, "SessionStart", "s1",
+        { source: "startup", transcript_path: TRANSCRIPT },
+        123, undefined, { [TRANSCRIPT]: fixture },
+      );
+
+      expect(deps.store.get("s1")!.turns.length).toBe(1);
+    });
+
+    it("survives a missing transcript file", () => {
+      const patches = fire(deps, "SessionStart", "s1", {
+        source: "resume", transcript_path: "/transcripts/gone.jsonl",
+      });
+
+      expect(deps.store.get("s1")!.turns.length).toBe(1);
+      expect(patches.some(p => p.op === "set_meta")).toBe(true);
+    });
+
+    it("survives a malformed transcript", () => {
+      const junk = "not json\n{\"type\":\n";
+      fire(
+        deps, "SessionStart", "s1",
+        { source: "resume", transcript_path: TRANSCRIPT },
+        123, undefined, { [TRANSCRIPT]: junk },
+      );
+
+      expect(deps.store.get("s1")!.turns.length).toBe(1);
     });
   });
 
