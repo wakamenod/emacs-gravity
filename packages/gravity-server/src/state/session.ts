@@ -530,6 +530,14 @@ export function completeTool(
   status: "done" | "error" = "done",
   postText?: string,
   postThinking?: string,
+  /**
+   * Elapsed seconds, when the caller already knows them. Live events don't:
+   * they arrive as the tool finishes, so wall-clock since `tool.timestamp`
+   * is the elapsed time. Transcript backfill does know, and must say so —
+   * deriving it there would report the age of the record, not the duration
+   * of the call.
+   */
+  duration?: number,
 ): Patch[] {
   const loc = s.toolIndex[toolUseId];
   if (!loc) return [];
@@ -541,7 +549,9 @@ export function completeTool(
 
   tool.status = status;
   tool.result = cleanResult;
-  if (tool.timestamp) {
+  if (duration != null) {
+    tool.duration = duration;
+  } else if (tool.timestamp) {
     tool.duration = (Date.now() - tool.timestamp) / 1000;
   }
   if (postText) tool.postText = postText;

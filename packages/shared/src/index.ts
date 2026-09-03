@@ -58,3 +58,13 @@ export { isSafeBashCommand } from "./safe-bash.js";
 // Services
 export { FileReadError, FileWriteError, Fs, FsLive, FsTest } from "./services/index.js";
 export type { FsService } from "./services/index.js";
+
+// Transcript backfill (Claude Code .jsonl → turn tree IR)
+export { parseTranscript } from "./transcript.js";
+export type {
+  ParsedTranscript,
+  ParsedTurn,
+  ParsedStep,
+  ParsedTool,
+  ParseTranscriptOptions,
+} from "./transcript.js";
